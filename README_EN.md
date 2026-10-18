@@ -217,22 +217,51 @@ codex "Your task"
 
 ## Model Routing
 
+Requests are automatically routed to Keys that support the requested model, based on the `model` field parsed from the request body.
+
 ### Configuration
 
-- `models` field on a key (array): routing admission — the list of model names this key accepts. Unset/empty = wildcard (accepts all)
-- `model` field on a key (string): forces `body.model` to be replaced with this value when forwarding upstream
-- Both are independent: `models` controls admission, `model` controls the actual upstream model
+Add a `models` array to a Key in `keys.json`:
+
+```json
+{"key": "sk-xxx...", "url": "https://...", "models": ["gpt-5.5", "gpt-5.4-mini"], "reset": "weekly"}
+```
+
+| `models` field | Behavior |
+|---|---|
+| Unset or `[]` | Matches all models (wildcard / backward compatible) |
+| `["gpt-5.5", "gpt-5.4"]` | Matches only the listed models |
+
+| Field | Purpose | When |
+|---|---|---|
+| `models` (admission) | Routing admission: which model requests this Key accepts | At `pickKey` time |
+| `model` (override) | Forwarding replacement: force the upstream to use this model | When sending the request |
 
 ### Routing Logic
 
-1. Client request carries a `model` name
-2. Among all non-cooling keys in the group, filter by `models` admission
-3. Order the filtered keys by scheduling rules; pick the first
-4. If the picked key has a `model` override, replace the request's model before forwarding
+1. `pickKey()` receives the `model` parameter from the request
+2. Filter the Key pool: Keys with `models` unset or containing the model enter the candidate pool
+3. Within the candidate pool, pick the best Key by the normal priority/round-robin logic
+4. If no Key matches → fall back to wildcard Keys (`models` unset)
+5. If there is no wildcard Key either → `502 All keys exhausted`
 
 ### Model Override
 
-```
+The singular `model` field works independently of the `models` array:
+
+**Behavior**:
+- `model` set → whatever model the CLI sends, the proxy force-replaces `body.model` with this value before forwarding (highest priority)
+- `model` empty → **model-aware adaptation**: the proxy probes the upstream's model list (deduplicated by upstream URL, success TTL 10 min, failure retry every 30 s, degraded to `unknown` during failures) and maps on demand to the nearest available model —
+  - Claude Code sends `claude-opus-4-5` and the upstream is a gpt relay → mapped automatically to the strongest gpt model the upstream supports
+  - Claude Code sends `claude-haiku-4-5` (small tier) → mapped to the smallest gpt model the upstream supports
+  - Codex CLI sends `gpt-5.6` and the upstream is a claude relay → mapped automatically to a claude model
+  - Upstream capability is claude/mixed, or the model name is outside the claude/gpt families → passthrough unchanged (same as before)
+  - Upstream probe fails (`unknown`) → conservative passthrough without guessing, other clients unaffected
+- If the Key's API key does not support the final model, the upstream returns an error and the Key enters cooldown (fix it with the `model` override field)
+- Does not affect `models` routing filters: the two compose
+
+**Typical scenario**:
+```bash
 # A key's configuration
 #   models: ["gpt-5.5"]      → only accepts gpt-5.5 requests
 #   model:  "gpt-5.6-sol"    → but forwards as gpt-5.6-sol upstream
@@ -278,6 +307,43 @@ The "Manage Keys" dialog provides two model inputs per row:
 - **Override model** (`model`, single value): force-replace on forwarding
 
 Changes take effect immediately after saving, no restart needed.
+
+## LAN Access
+
+By default the proxy only listens on `localhost` (127.0.0.1), so only the local machine can use it. To let other computers on the LAN use this machine's proxy for large models, switch the network mode in the system config.
+
+### How to Enable
+
+1. Open the Dashboard (`http://localhost:3456/`) → System Config
+2. Under "🌐 Network Mode" select "LAN accessible"
+3. Set a "LAN connection password" (recommended, to prevent unauthorized access)
+4. Save → the proxy restarts automatically and starts listening on `0.0.0.0`
+
+### LAN Client Configuration
+
+Configure other computers as follows:
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://<this machine's LAN IP>:3456` |
+| API Key | The LAN connection password you set |
+
+For example, if this machine's IP is `192.168.1.19` and the password is `my-secret-key`:
+
+```bash
+curl http://192.168.1.19:3456/v1/models \
+  -H "Authorization: Bearer my-secret-key"
+```
+
+### Security Notes
+
+| Scenario | Behavior |
+|---|---|
+| Local requests | Any Bearer token is accepted (same as default mode) |
+| LAN requests + password set | The correct Bearer token is required |
+| LAN requests + no password set | Allowed (backward compatible, but not recommended) |
+
+> To protect the Dashboard admin panel, set a separate "admin Token" (independent of the LAN connection password).
 
 ## Automatic Failed-Key Switching
 
@@ -537,11 +603,11 @@ The protocol conversion layer lets any downstream client connect to any upstream
 | Claude Code CLI | `/v1/messages` | Messages → Chat / Responses → Messages | any Chat / Messages / Responses upstream |
 | Chat client | `/v1/chat/completions` | Chat → Messages / Responses → Chat | any Chat / Messages / Responses upstream |
 
-- Upstream protocol auto-detection: static judgment from `url` in `keys.json` (`api.openai.com`/`api.ofox.ai` = native Responses, `api.anthropic.com` = native Messages, everything else = generic Chat), plus dynamic probing for unknown relays (`/v1/models` available → Chat; otherwise probe `/v1/messages`, then `/v1/responses`). Dynamic results are written to a dedicated protocol cache (24h TTL) decoupled from the model-list cache (success 10min / failure 30s): even if a relay's `/v1/models` probe fails, already-identified Messages/Responses protocols are not wrongly downgraded back to Chat. A background task re-probes upstreams every 10 minutes deduplicated by URL (multiple keys in the same pool trigger one probe); new/changed keys take effect without restart
+- Upstream protocol auto-detection: static judgment from `url` in `keys.json` (`api.openai.com`/`api.ofox.ai` = native Responses, `api.anthropic.com` = native Messages, `anytokens.cc` = generic Chat only and exempt from dynamic probing, everything else = generic Chat), plus dynamic probing for unknown relays (`/v1/models` available → Chat; otherwise probe `/v1/messages`, then `/v1/responses`). Dynamic results are written to a dedicated protocol cache (24h TTL) decoupled from the model-list cache (success 10min / failure 30s): even if a relay's `/v1/models` probe fails, already-identified Messages/Responses protocols are not wrongly downgraded back to Chat. A background task re-probes upstreams every 10 minutes deduplicated by URL (multiple keys in the same pool trigger one probe); new/changed keys take effect without restart
 - The `/v1/chat/completions` multi-protocol pool judgment also uses dynamic protocol: if any account in the group (static whitelist or dynamic probe) is identified as a Messages/Responses upstream, Chat→Messages / Chat→Responses conversion fallback is enabled automatically, no need to mark it explicitly on `url`
 - Same-protocol upstreams pass through first (byte passthrough / terminal protection); conversion only happens cross-protocol to avoid needless rewriting; protocol pool order: downstream Chat → `chat, messages, responses`; downstream Messages → `messages, chat, responses`; downstream Responses → `responses, chat, messages`
 - Any key failure auto-switches to the next protocol pool's downstream key retry; `#N` forced key, boost/round-robin, cooldown and capacity requeue still work
-- When the upstream returns a "path/protocol not supported" error (e.g. anytokens' `does not allow /v1/messages dispatch`), it is classified as `unsupported_path`: the error is passed back to the caller unchanged, but it is **not written to the Key's `failCode`**, so the key is not cooled down, locked, or judged invalid — even if other LAN devices or local apps use the wrong protocol, shared keys are never polluted and other healthy tasks are unaffected
+- When the upstream returns a "path/protocol not supported" error (e.g. anytokens' `does not allow /v1/messages dispatch`, or an OpenAI-only relay answering Ollama-style probe paths with `HTTP node only allows access to inference API paths`), it is classified as `unsupported_path`: the error is passed back to the caller unchanged, but it is **not written to the Key's `failCode`**, so the key is not cooled down, locked, or judged invalid — even if other LAN devices or local apps use the wrong protocol (including another project's process scanning the model list via non-inference paths such as `/api/show` and `/api/tags`), shared keys are never polluted and other healthy tasks are unaffected
 - Conversion supports **streaming and non-streaming**: cross-protocol streaming forces `stream:true`, responses rewritten through SSE converters; non-streaming requests go through one-shot JSON response converters
 - Conversion fields: text, system/instructions, tool definitions and call chains (`tool_use`↔`function_call`), thinking content (`thinking`↔`reasoning`↔`reasoning_content`), images, usage stats
 
@@ -1414,6 +1480,9 @@ A: Frontend deletion is a soft delete (sets `status="deleted"`); the Key is stil
 **Q: A Key got auto-locked. How do I recover it?**
 A: Find the 🔒 locked Key in the admin dialog and click the 🔓 unlock button, or call `POST /__reset-key {"idx": N}` manually. You can also disable auto-lock (uncheck "Enable auto lock") or adjust the `lockAfterFailCount` threshold in config.
 
+**Q: Another LAN device (or a local app) used a protocol/path the upstream doesn't support — will it invalidate my Keys?**
+A: No. When the upstream returns a "path/protocol not supported" error such as `does not allow /v1/messages dispatch` or `HTTP node only allows access to inference API paths` (typical cases: sending Anthropic Messages requests to an OpenAI-only upstream; a LAN/local client configured the wrong connection mode; or another project's process scanning the model list via Ollama-style paths like `/api/show` and `/api/tags` while the OpenAI-only relay answers 403), the proxy classifies it as `unsupported_path`: the request is still forwarded faithfully and the upstream error (e.g. 403) is returned to the caller so it correctly perceives the failure, but the error is **not** recorded as the Key's `failCode`, so it does not enter cooldown, does not trigger auto-lock, and does not cause a `reset:"never"` Key to be judged invalid — other healthy tasks sharing that Key (including local codex) are completely unaffected. Real Key failures (401 auth failure, insufficient balance, etc.) still cool down and lock normally.
+
 **Q: Cost estimates are off?**
 A: First adjust the global `bytesPerToken` and `prices`; different models have different token densities, so you can use `modelPricing` to set a per-model unit price and `bytesPerToken` by exact name. This is still a byte estimate, and price changes don't recompute historical costs.
 
@@ -1444,6 +1513,10 @@ This section collects reviewed public contributions, issue reports, and design s
 | [@anupamme](https://github.com/anupamme) | proposed the security improvement that the admin Token should not be stored in browser session storage (PR [#1](https://github.com/aipayim/codex-proxy/pull/1)). Current version implements the in-memory adaptation on the latest code and completes the WebSocket auth path. |
 
 ## Changelog
+
+- **2026-10-18 Protocol and stream consistency fixes (static Chat-native whitelist / tool_choice degrade / pure tool-call terminal)**: ① Added the static `CHAT_NATIVE_HOSTS` Chat-only relay whitelist (e.g. `anytokens.cc`): these hosts are always routed as `chat`, so a `/v1/messages` request rejected by the upstream account-group policy is never misdetected as Messages/Responses by dynamic probing; the static whitelist beats the dynamic protocol cache. ② Once a successful `/v1/models` probe has pinned the protocol to `chat`, a transient probe failure no longer overwrites the confirmed protocol with endpoint-guessing results (`failWithProtocol` prefers the protocol cache), fixing the regression where a confirmed chat relay was mislabeled `messages`/`responses` during flaky probes. ③ All four request-direction converters (responses/messages↔chat) now drop `tool_choice` together when there is no `tools` array or it is empty, avoiding the OpenAI-strict 400 `"tool_choice is only allowed when tools are specified"`. ④ Converted streams now handle 4xx properly: a new `tools_reasoning_incompatible` classification triggers a same-key automatic degrade retry with `reasoning_effort=none` (exactly once, tools/stream preserved so the tool loop keeps running) when the upstream rejects the tools+reasoning combination; all other 4xx responses no longer pipe the JSON error body into the SSE converter (which produced a fake `upstream_eof_without_done` terminal) but surface the real upstream error to the caller, without writing `failCode` or cooling the key (a request-shape problem, not a key problem). ⑤ A pure tool-call response (no text) no longer emits an empty `response.output_text.done`, so strict OpenAI Responses clients (codex) no longer abort the turn on the desynced item; text responses still emit `output_text.done` carrying the real text. Regression tests and license updated accordingly (ISC → MIT, LICENSE file added).
+
+- **2026-10-18 `unsupported_path` matching broadened: non-inference-path 403s no longer poison `reset:"never"` Keys (3460/E-group incident)**: another project's process scanned the local proxy's model list via Ollama-style paths (`/api/show`, `/api/tags`, `/api/v1/models`), and an OpenAI-only relay answered those non-inference paths with 403 `HTTP node only allows access to inference API paths (...)`. That text missed the `unsupported_path` regex → it was treated as an ordinary upstream API error and went through `markFailure(403)`; E-group 4 put `reset:"never"` Keys into **cooldown with no time limit** (because `inCooldown()` judges never-keys solely by `!!failCode`), taking down the whole 3460 port until the Keys were manually reset from the key admin page. The `unsupported_path` regex in `classifyUpstreamErrorMessage` now also matches `only allows access to`: such 403s write no `failCode` and do not cool down the Key, while the error is still passed back to the probing caller unchanged (effective after proxy restart; battle-tested — after 30 probe 403s all 4 Keys stayed clean and kept returning 200). As a fallback, operations-side now enables `autoRecover: true` + `autoRecoverInterval: 1` (hour, with `autoRecoverCodes` including 403) so cooled-down Keys automatically run a lightweight `GET /v1/models` probe every hour with no manual reset needed. 403 entries showing `?` as the model in the Dashboard marquee are exactly these body-less probe requests (empty `reqModel`).
 
 - **2026-08-29 Fixed Messages→Chat tool-call chain break (Claude Code CLI)**: when `/v1/messages` (Claude Code CLI) forwards to a Chat upstream, the request-direction converter previously **dropped `tool_use` blocks from assistant messages and `tool_result` blocks from user messages** — first-round model tool calls arrived fine (the response direction `chat_to_messages_sse` correctly converts to `tool_use`), but from the second round onward requests carrying tool execution results had their tool context completely wiped, so the upstream never saw the calls or results and the tool loop broke. The request-direction converter now fully preserves tool context: `tool_use` → assistant `tool_calls` (text kept, pure-tool-call `content` set to `null`), `tool_result` → `role:"tool"` message, and it **no longer leaves an empty `content:""` user message** (the old implementation emitted a stray empty user message that broke the `assistant(tool_calls) → tool` ordering, which some OpenAI-compatible upstreams reject), keeping multi-turn tool round trips valid. Also fixed the `tool_choice` mapping: Anthropic `{type:"any"}` → OpenAI `"required"`, `{type:"tool",name}` → `{type:"function",function:{name}}` (previously it only took `.type`, producing an invalid value). Updated the README protocol-conversion docs and added regression assertions (tool_calls structure, no empty user message, tool directly after assistant, tool_choice mapping).
 

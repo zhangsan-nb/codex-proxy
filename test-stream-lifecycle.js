@@ -451,6 +451,10 @@ function testNoProgressWatchdogContracts(proxyDir) {
 
 function testNativeResponsesRouteContract(proxyDir) {
   const source = fs.readFileSync(path.join(proxyDir, "proxy.js"), "utf8");
+  // The bare /responses route parses the body, builds a native terminal probe
+  // for streaming requests, and forwards through forwardWithPriority (the
+  // deprecated nativeResponsesPath option was removed; upstream responses
+  // always use PROTO_PATHS.responses).
   assert.match(source, /pathname === "\/responses" && req\.method === "POST" && body/);
   assert.match(source, /requestBody && requestBody\.stream === true/);
   assert.match(source, /nativeResponsesProbe = createNativeResponsesTerminalProbe\(requestBody\.model \|\| ""\)/);
@@ -475,12 +479,30 @@ async function testToolCallCompletion(harness) {
   const names = eventNames(output);
   assert.strictEqual(lifecycle.terminalKind, "completed");
   assert.ok(names.includes("response.output_item.added"));
-  assert.ok(names.includes("response.function_call_arguments.starting"));
   assert.ok(names.includes("response.function_call_arguments.delta"));
   assert.ok(names.includes("response.function_call_arguments.done"));
   assert.ok(names.includes("response.output_item.done"));
   assert.ok(names.includes("response.completed"));
   assert.strictEqual(names.filter(name => name === "response.function_call_arguments.done").length, 1);
+  // Regression: a pure tool-call response (no message text) must NOT emit an
+  // empty response.output_text.done — strict OpenAI Responses clients (codex)
+  // reject the desynced item and abort the turn ("Conversation interrupted").
+  assert.ok(!names.includes("response.output_text.done"), "pure tool-call response must not emit response.output_text.done");
+}
+
+async function testTextResponseEmitsOutputTextDone(harness) {
+  // Regression guard for the A fix: a normal text response must still emit a
+  // response.output_text.done carrying the real text (not be dropped by the
+  // itemClosed guard), while the non-standard arguments.starting event is gone.
+  const first = chatChunk({ content: "hello world" });
+  const stop = chatChunk({}, { finishReason: "stop" });
+  const { lifecycle, output } = await runStream(harness, [`data: ${first}\n`, `data: ${stop}\n`, "data: [DONE]\n"]);
+  const names = eventNames(output);
+  assert.strictEqual(lifecycle.terminalKind, "completed");
+  assert.ok(names.includes("response.output_text.done"), "text response must emit response.output_text.done");
+  assert.ok(!names.includes("response.function_call_arguments.starting"), "non-standard arguments.starting event must be removed");
+  const doneLine = output.split("\n").find(l => l.startsWith("data: ") && l.includes('"response.output_text.done"'));
+  assert.ok(doneLine && doneLine.includes("hello world"), "output_text.done must carry the real text");
 }
 
 function testClientCancellation(harness) {
@@ -690,6 +712,7 @@ async function main() {
   testNativeResponsesRouteContract(__dirname);
   testNoProgressWatchdogContracts(__dirname);
   await testToolCallCompletion(harness);
+  await testTextResponseEmitsOutputTextDone(harness);
   testClientCancellation(harness);
   await testModelAtCapacityError(harness);
   await testInsufficientQuotaError(harness);

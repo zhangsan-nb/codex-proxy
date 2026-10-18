@@ -106,11 +106,27 @@ Point an OpenAI-compatible client at `http://localhost:3456/v1`. Add groups such
 
 ## Evolution
 
-This timeline records every tagged release from `v2.26.0` through `v2.60.0`. Each entry intentionally keeps an English and Chinese explanation together so the public landing page remains English-first without losing release context for Chinese readers.
+This timeline records every tagged release from `v2.26.0` through `v2.61.0`. Each entry intentionally keeps an English and Chinese explanation together so the public landing page remains English-first without losing release context for Chinese readers.
+
+### v2.61.0 🛡️ Static Chat-native whitelist, tool_choice degrade, and stream terminal fixes
+- 🇬🇧 **English:** Added a static Chat-native host whitelist (`CHAT_NATIVE_HOSTS`, e.g. `anytokens.cc`) so Chat-only relays are always routed as `chat` and can never be misrouted as Messages/Responses by the dynamic protocol cache; a confirmed protocol now survives transient probe failures; broadened `unsupported_path` matching with `only allows access to` so non-inference-path 403s no longer poison `reset:"never"` keys; request converters drop `tool_choice` when `tools` is absent/empty (strict-relay 400), converted streams auto-degrade `reasoning_effort=none` once for the tools+reasoning rejection and surface real 4xx errors instead of fake EOF terminals; pure tool-call responses no longer emit an empty `response.output_text.done`; license unified to MIT with a LICENSE file; regression tests aligned.
+- 🇨🇳 **中文：** 新增静态 Chat-only 中继白名单（`CHAT_NATIVE_HOSTS`，如 `anytokens.cc`），此类主机恒定按 `chat` 路由，动态协议缓存误判也无法将其改道为 Messages/Responses；瞬时探测失败不再覆盖已确认协议；`unsupported_path` 正则追加 `only allows access to`，非推理路径 403 不再毒化 `reset:"never"` Key；四个请求转换器在无 `tools`/`tools:[]` 时同步丢弃 `tool_choice`（避开 strict 上游 400），转换流遇 tools+reasoning 拒绝时同 Key 自动降级 `reasoning_effort=none` 重试一次，其余 4xx 直接返回真实上游错误而非假 EOF 终态；纯工具调用响应不再发空 `response.output_text.done`；许可证统一为 MIT 并新增 LICENSE；回归测试对齐。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.60.1 🧯 Queue drain re-entrancy guard
+- 🇬🇧 **English:** Fixed a queue drain re-entrancy guard so concurrent drain triggers cannot double-process the same queued request, and aligned the capacity-backoff lifecycle test with the new guard.
+- 🇨🇳 **中文：** 修复队列排水重入保护，防止并发触发排水时同一排队请求被重复处理；同步对齐容量退避生命周期测试。
+- 🔗 [Full changelog](README_CN.md#更新日志)
 
 ### v2.60.0 🔧 Messages→Chat tool-call chain fix (Claude Code CLI)
 - 🇬🇧 **English:** Fixed the broken tool-call chain when `/v1/messages` (Claude Code CLI) forwards to a Chat upstream: the request-direction converter now preserves full tool context by mapping `tool_use` → assistant `tool_calls`, `tool_result` → `role:"tool"` messages, removing the stray empty `user` message, and mapping `tool_choice` correctly (`any` → `"required"`, `tool` → `function`), so multi-turn tool loops never break.
 - 🇨🇳 **中文：** 修复 `/v1/messages`（Claude Code CLI）→ Chat 上游时工具调用链断裂：请求方向转换器现完整保留工具上下文，`tool_use` → assistant `tool_calls`、`tool_result` → `role:"tool"` 消息，移除残留空白 user 消息，并正确映射 `tool_choice`（`any` → `"required"`、`tool` → `function`），多轮工具循环不再断裂。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.59.1 📝 README sync for unsupported_path docs
+- 🇬🇧 **English:** Synchronized the README documentation for the v2.59.0 `unsupported_path` classification (protocol detection, FAQ, and changelog) across the Chinese full text, English full text, and the landing page.
+- 🇨🇳 **中文：** 同步 v2.59.0 `unsupported_path` 错误分类的 README 文档（协议检测说明、FAQ 与更新日志）至中文全文、英文全文与首页。
 - 🔗 [Full changelog](README_CN.md#更新日志)
 
 ### v2.59.0 🛡️ unsupported_path error classification protects shared keys
@@ -118,9 +134,49 @@ This timeline records every tagged release from `v2.26.0` through `v2.60.0`. Eac
 - 🇨🇳 **中文：** 新增 `unsupported_path` 错误分类：上游因路径/协议不支持而拒绝请求时（如 anytokens 的 `does not allow /v1/messages dispatch`），错误如实回传调用方，但**不写入 Key 的 `failCode`**，不冷却、不锁定、不判失效——共享该 Key 的其他任务（本机 codex、局域网设备）不受影响。
 - 🔗 [Full changelog](README_CN.md#更新日志)
 
+### v2.58.1 🧹 Removed sk- prefix validation
+- 🇬🇧 **English:** Removed the local `sk-` prefix validation for pasted Keys to stay aligned with the source implementation, so upstream tokens in any format are accepted.
+- 🇨🇳 **中文：** 移除粘贴 Key 时本地的 `sk-` 前缀校验，与源码实现对齐，任意格式的上游 token 均可录入。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
 ### v2.58.0 📡 Responses SSE streaming protocol compliance
 - 🇬🇧 **English:** Major overhaul of Responses SSE streaming lifecycle: added proper `output_item.added` / `output_item.done` message item lifecycle with `openMessageItem` / `closeMessageItem`, persistent `outputItems` tracking with correct `output_index` assignment, `_itemClosed` flag to prevent duplicate close events, `toolCallNames` / `toolOutputIndices` for tool call tracking, and `item_id` / `output_index` / `content_index` fields in all text delta events. Bare path normalization removed; clients should use standard `/v1/...` paths.
 - 🇨🇳 **中文：** 大幅改进 Responses SSE 流式生命周期：新增 `output_item.added` / `output_item.done` 消息项生命周期（`openMessageItem` / `closeMessageItem`）、持久 `outputItems` 追踪与正确 `output_index` 分配、`_itemClosed` 标志防止重复关闭、`toolCallNames` / `toolOutputIndices` 工具调用追踪、所有文本 delta 事件包含 `item_id` / `output_index` / `content_index` 字段。移除裸路径归一化，客户端应使用标准 `/v1/...` 路径。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.57.7 🛤️ Bare path auto-normalization
+- 🇬🇧 **English:** Auto-normalized bare `/responses`, `/messages`, `/chat/completions`, and `/models` requests to their `/v1/...` equivalents.
+- 🇨🇳 **中文：** 裸路径 `/responses`、`/messages`、`/chat/completions`、`/models` 自动归一化为 `/v1/...` 等价路径。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.57.6 🔁 /v1 dedup for probes and models endpoint
+- 🇬🇧 **English:** Extended `/v1` path deduplication to protocol probes and the models endpoint, preventing double-`/v1` upstream paths.
+- 🇨🇳 **中文：** 将 `/v1` 路径去重扩展至协议探测与模型列表端点，避免上游出现双 `/v1` 路径。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.57.5 🚫 Double `/v1/v1` forwarding fix
+- 🇬🇧 **English:** Prevented double `/v1/v1` paths when forwarding requests upstream.
+- 🇨🇳 **中文：** 修复转发上游时出现 `/v1/v1` 双重路径的问题。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.57.4 ⚖️ Round-robin selection cleanup
+- 🇬🇧 **English:** Simplified round-robin Key selection and removed the redundant fallback branch.
+- 🇨🇳 **中文：** 简化轮询选 Key 逻辑，移除冗余的回退分支。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.57.3 🧹 LAN auth dedup and probe filtering
+- 🇬🇧 **English:** Removed the duplicate LAN auth middleware and filtered 403/402 responses out of protocol probing so dead endpoints are not misclassified.
+- 🇨🇳 **中文：** 移除重复的局域网认证中间件，并在协议探测中过滤 403/402 响应，避免失效端点被误判。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.57.2 🔐 Server-side LAN API key enforcement
+- 🇬🇧 **English:** Added the missing LAN auth middleware so the server-side API key is actually enforced for LAN clients.
+- 🇨🇳 **中文：** 补上缺失的局域网认证中间件，服务端 API 密钥对局域网客户端真正生效。
+- 🔗 [Full changelog](README_CN.md#更新日志)
+
+### v2.57.1 🔑 Restart-status auth fix
+- 🇬🇧 **English:** Added admin authentication to the restart-status fetch endpoint.
+- 🇨🇳 **中文：** 为重启状态查询接口补充管理员认证。
 - 🔗 [Full changelog](README_CN.md#更新日志)
 
 ### v2.57.0 🌐 LAN access mode

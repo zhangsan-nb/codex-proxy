@@ -217,11 +217,21 @@ const TASK_DISTILL_ENGINES = ["ollama", "proxy", "external"];
 // --- Protocol compatibility hosts ---
 const RESPONSES_NATIVE_HOSTS = ["api.openai.com", "api.ofox.ai"];
 const MESSAGES_NATIVE_HOSTS = ["api.anthropic.com"];
+// Relays that are OpenAI-compatible Chat ONLY. They skip dynamic protocol
+// detection entirely and are always routed as "chat": a misdetected
+// Messages/Responses classification in the dynamic protocol cache cannot
+// override a host listed here. anytokens.cc rejects /v1/messages at the
+// account-group policy level ("This group does not allow /v1/messages
+// dispatch") while serving /v1/chat/completions fine.
+const CHAT_NATIVE_HOSTS = ["anytokens.cc"];
 function isResponsesNative(url) {
   try { return RESPONSES_NATIVE_HOSTS.includes(new URL(url).hostname); } catch(e) { return false; }
 }
 function isMessagesNative(url) {
   try { return MESSAGES_NATIVE_HOSTS.includes(new URL(url).hostname); } catch(e) { return false; }
+}
+function isChatNative(url) {
+  try { return CHAT_NATIVE_HOSTS.includes(new URL(url).hostname); } catch(e) { return false; }
 }
 // The wire protocol an upstream speaks. Known native hosts are decided by the
 // static whitelist; unknown hosts fall back to the protocol discovered by
@@ -232,6 +242,7 @@ function upstreamProtocolForUrl(url) {
   if (!url) return "chat";
   if (isMessagesNative(url)) return "messages";
   if (isResponsesNative(url)) return "responses";
+  if (isChatNative(url)) return "chat";
   return "chat";
 }
 function upstreamProtocolFor(idx) {
@@ -239,6 +250,10 @@ function upstreamProtocolFor(idx) {
   if (!acct || !acct.url) return "chat";
   if (isMessagesNative(acct.url)) return "messages";
   if (isResponsesNative(acct.url)) return "responses";
+  // Static chat whitelist beats the dynamic protocol cache: a Chat-only relay
+  // must never be misrouted as Messages/Responses, even if a prior dynamic
+  // probe misclassified it.
+  if (isChatNative(acct.url)) return "chat";
   // Persistent dynamic-detection result wins over the transient failed-probe
   // capability (which expires after 30s): a Messages/Responses relay discovered
   // once stays classified correctly for UPSTREAM_PROTOCOL_TTL_MS.
@@ -2851,15 +2866,25 @@ function extractUpstreamErrorMessage(payload) {
 
 function classifyUpstreamErrorMessage(message) {
   const text = String(message || "");
+  // Upstream rejects a converted Chat body that carries BOTH tools and
+  // reasoning_effort. Its own documented escape hatch is reasoning_effort=none,
+  // so this must be classified before generic patterns (the message also
+  // contains "not supported").
+  if (/Function tools with reasoning_effort are not supported/i.test(text)) return "tools_reasoning_incompatible";
   if (/model (not found|does not exist|is not supported|is not available|not allowed)|no such model|unknown model|model_not_found|model_does_not_exist|invalid model|model .*doesn'?t exist|is not a valid model|model .*not found|does not support.*model|unsupported model|not supported by this model/i.test(text)) return "model_not_found";
   if (/capacity|at capacity|overloaded|busy|try a different model|not currently available/i.test(text)) return "model_at_capacity";
   if (/quota|insufficient|billing|billing_hard_limit|_limit_exceeded|usage limit|usage_limit|daily limit|weekly limit|monthly limit/i.test(text)) return "insufficient_quota";
   // The upstream rejected the request path/protocol (not the key). e.g.
   // anytokens returns "This group does not allow /v1/messages dispatch"
   // when an Anthropic Messages request is sent to an OpenAI-only group.
+  // An OpenAI-only relay returns "HTTP node only allows access to inference
+  // API paths (/v1/chat/completions, ...)" when an Ollama-style probe
+  // (/api/show, /api/tags) hits its OpenAI-only HTTP node. Observed
+  // 2026-10-18: those 403s poisoned reset:"never" E-group keys until a manual
+  // reset.
   // This is a request-shape problem, not a key problem: the caller's
   // protocol is unsupported, so the error must NOT cool the shared key.
-  if (/does not allow|not allowed to (access|use)|not permitted|dispatch|path not supported|endpoint not supported|forbidden (path|route|endpoint)|unsupported (path|endpoint|protocol)|protocol not (allowed|supported)|method not (allowed|supported)|invalid path/i.test(text)) return "unsupported_path";
+  if (/does not allow|not allowed to (access|use)|not permitted|dispatch|path not supported|endpoint not supported|forbidden (path|route|endpoint)|unsupported (path|endpoint|protocol)|protocol not (allowed|supported)|method not (allowed|supported)|invalid path|only allows access to/i.test(text)) return "unsupported_path";
   return "upstream_api_error";
 }
 
@@ -6188,6 +6213,16 @@ function doProbeUpstream(acct) {
       resolve({ ...result, fetchedAt: Date.now() });
     };
     const failWithProtocol = () => {
+      // A protocol confirmed by a successful /v1/models probe (pinned in the
+      // cache) must survive transient probe failures: the endpoint-guessing
+      // fallback (/v1/messages -> /v1/responses -> 400-on-exists) can
+      // misclassify a confirmed Chat-only relay as "messages"/"responses".
+      // Only probe dynamically when no confirmed protocol is cached yet.
+      const cachedProtocol = upstreamProtocolCache.get(upstreamCacheKeyFromUrl(acct.url));
+      if (cachedProtocol) {
+        finish({ models: [], claudeModels: [], gptModels: [], otherModels: [], capability: "unknown", protocol: cachedProtocol, failed: true });
+        return;
+      }
       detectUpstreamProtocol(acct, targetUrl, mod).then(protocol => {
         const resolvedProtocol = protocol || "chat";
         upstreamProtocolCache.set(upstreamCacheKeyFromUrl(acct.url), resolvedProtocol);
@@ -6382,6 +6417,8 @@ function forwardRequest(idx, method, headers, body, clientRes, pathname, onDone,
   }
   if (acct.model) logEntry.overrideModel = acct.model;
 
+  let degradeRetried = false;
+  const sendUpstream = (body) => {
   const proxyReq = mod.request(options, (apiRes) => {
     if (onDone.done) { apiRes.destroy(); return; }
     ttfb = Date.now() - reqStart;
@@ -6444,6 +6481,63 @@ function forwardRequest(idx, method, headers, body, clientRes, pathname, onDone,
         addLog(logEntry);
         const _ks1=getKeyState(idx);_ks1.lastStatus=statusCode;_ks1.lastTime=Date.now();_ks1.lastModel=logEntry.overrideModel||logEntry.reqModel||null;
         onDone({ switched: true, idx, code: statusCode, reason, errorMessage, source: "upstream_http_error", capacityRetry: isCapacity, modelLevel: isModelLevel, urlLevel: isModelLevel || isServerError });
+      });
+      return;
+    }
+
+    // A JSON error body must never be piped through an SSE converter: it gets
+    // garbled into a fake "upstream_eof_without_done" terminal and hides the
+    // real upstream error from the caller. Read and classify the error first.
+    if (extraTransform && !extraTransform._nativeResponsesProbe && apiRes.statusCode >= 400 && apiRes.statusCode < 500) {
+      if (onDone.done) { apiRes.destroy(); return; }
+      onDone.done = true;
+      const statusCode = apiRes.statusCode;
+      captureUpstreamErrorMessage(apiRes, errorMessage => {
+        const reason = errorMessage ? classifyUpstreamErrorMessage(errorMessage) : "upstream_api_error";
+        // Known request-shape incompatibility with a documented upstream escape
+        // hatch: retry the SAME key exactly once with reasoning_effort=none,
+        // keeping tools/stream intact so the tool loop still runs.
+        if (reason === "tools_reasoning_incompatible" && !degradeRetried) {
+          let retryBody = null;
+          try {
+            const parsed = JSON.parse(body.toString());
+            if (Array.isArray(parsed.tools) && parsed.tools.length && parsed.reasoning_effort !== "none") {
+              parsed.reasoning_effort = "none";
+              retryBody = Buffer.from(JSON.stringify(parsed));
+            }
+          } catch (e) {}
+          if (retryBody) {
+            degradeRetried = true;
+            onDone.done = false;
+            console.log(`[proxy] #${idx + 1} → 400 tools+reasoning incompatible, retrying same key with reasoning_effort=none`);
+            sendUpstream(retryBody);
+            return;
+          }
+        }
+        // Surface the real upstream error to the caller. Request-shape errors
+        // are not key failures: no markFailure, no cooldown (same principle as
+        // unsupported_path) — the key is healthy, the request was not.
+        activeDecr(idx);
+        const dur = Date.now() - reqStart;
+        recordRequest(idx, false, 0, 0, dur, ttfb, modelDisplayLabel(reqModel || resolvedModel, effectiveModel), statusCode, client, requestPricing);
+        recordPath(pathname, method, 0, 0, dur);
+        Object.assign(logEntry, {
+          status: statusCode,
+          inputBytes: body ? body.length : 0,
+          outputBytes: 0,
+          duration: dur,
+          ttfb,
+          upstreamErrorReason: reason,
+          streamErrorMsg: errorMessage,
+          terminalSource: "upstream_http_error",
+        });
+        addLog(logEntry);
+        const _ks4xx=getKeyState(idx);_ks4xx.lastStatus=statusCode;_ks4xx.lastTime=Date.now();_ks4xx.lastModel=logEntry.overrideModel||logEntry.reqModel||null;
+        if (!clientRes.headersSent && !clientRes.destroyed) {
+          clientRes.writeHead(statusCode, { "content-type": "application/json" });
+          clientRes.end(JSON.stringify({ error: { message: errorMessage || "Upstream rejected the request", type: "invalid_request_error", code: reason } }));
+        }
+        onDone({ switched: false, idx });
       });
       return;
     }
@@ -6728,6 +6822,8 @@ function forwardRequest(idx, method, headers, body, clientRes, pathname, onDone,
     proxyReq.write(bodyToWrite);
   }
   proxyReq.end();
+  };
+  sendUpstream(body);
 }
 
 function forwardWithPriority(method, headers, body, clientRes, pathname, extraTransform, group, opts) {
@@ -12027,11 +12123,14 @@ function responsesToChatRequest(upstreamUrl, body) {
       }
     }
   }
-  if (body.tools) chatBody.tools = body.tools.map(t => {
+  if (Array.isArray(body.tools) && body.tools.length) chatBody.tools = body.tools.map(t => {
     if (t.type === "function") return { type: "function", function: { name: t.name, description: t.description, parameters: t.input_schema || t.parameters } };
     return t;
   });
-  if (body.tool_choice) chatBody.tool_choice = body.tool_choice;
+  // tool_choice without tools is rejected by OpenAI-strict relays
+  // ("'tool_choice' is only allowed when 'tools' are specified"), and an
+  // empty tools array is equivalent to no tools at all.
+  if (body.tool_choice && chatBody.tools) chatBody.tool_choice = body.tool_choice;
   if (body.temperature !== undefined) chatBody.temperature = body.temperature;
   if (body.top_p !== undefined) chatBody.top_p = body.top_p;
   if (body.stop) chatBody.stop = body.stop;
@@ -12107,7 +12206,7 @@ function createResponsesLifecycle(model) {
       if (!this._started) this.emitStart();
       this.terminalKind = "completed";
       this.terminalReason = normalizeStreamTerminalReason(reason, "upstream_done");
-      if (!this._itemClosed) this._pushEvent("response.output_text.done", { type: "response.output_text.done", delta: "" });
+      if (!this._itemClosed && this.fullContent) this._pushEvent("response.output_text.done", { type: "response.output_text.done", delta: "" });
       const outputItems = (this._outputItems && this._outputItems.length)
         ? this._outputItems.slice().sort((a, b) => a.output_index - b.output_index).map(e => e.item)
         : [{ type: "message", role: "assistant", content: [{ type: "output_text", text: this.fullContent }] }];
@@ -12950,13 +13049,15 @@ function messagesToChatRequest(upstreamUrl, body) {
       }
     }
   }
-  if (body.tools) {
+  if (Array.isArray(body.tools) && body.tools.length) {
     chatBody.tools = body.tools.map(t => ({
       type: "function",
       function: { name: t.name, description: t.description || "", parameters: t.input_schema || {} }
     }));
   }
-  if (body.tool_choice) {
+  // tool_choice without tools (or with an empty tools array) is rejected by
+  // OpenAI-strict relays; drop both together.
+  if (body.tool_choice && chatBody.tools) {
     const tc = body.tool_choice;
     if (typeof tc === "string") {
       chatBody.tool_choice = tc;
@@ -13229,14 +13330,15 @@ function chatToMessagesRequest(upstreamUrl, body) {
     }
     if (systemParts.length) msgsBody.system = systemParts.join("\n");
   }
-  if (body.tools) {
+  if (Array.isArray(body.tools) && body.tools.length) {
     msgsBody.tools = body.tools.map(t => ({
       name: t.function?.name || t.name || "",
       description: t.function?.description || t.description || "",
       input_schema: t.function?.parameters || t.parameters || {}
     }));
   }
-  if (body.tool_choice) {
+  // tool_choice without tools is invalid for strict upstreams; drop together.
+  if (body.tool_choice && msgsBody.tools) {
     msgsBody.tool_choice = typeof body.tool_choice === "string" ? { type: body.tool_choice } : body.tool_choice;
   }
   if (body.stop) msgsBody.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
@@ -13586,10 +13688,11 @@ function responsesToMessagesRequest(upstreamUrl, body) {
       }
     }
   }
-  if (body.tools) {
+  if (Array.isArray(body.tools) && body.tools.length) {
     msgs.tools = body.tools.map(t => t.type === "function" ? { name: t.name, description: t.description || "", input_schema: t.parameters || {} } : t);
   }
-  if (body.tool_choice) msgs.tool_choice = typeof body.tool_choice === "string" ? { type: body.tool_choice } : body.tool_choice;
+  // tool_choice without tools is invalid for strict upstreams; drop together.
+  if (body.tool_choice && msgs.tools) msgs.tool_choice = typeof body.tool_choice === "string" ? { type: body.tool_choice } : body.tool_choice;
   if (body.temperature !== undefined) msgs.temperature = body.temperature;
   if (body.top_p !== undefined) msgs.top_p = body.top_p;
   if (body.stop) msgs.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];

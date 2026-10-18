@@ -665,11 +665,11 @@ Webhook URL、价格参数、桌面通知/声音开关、🔄 自动恢复冷却
 | Claude Code CLI | `/v1/messages` | Messages → Chat / Responses → Messages | 任意 Chat / Messages / Responses 上游 |
 | Chat 客户端 | `/v1/chat/completions` | Chat → Messages / Responses → Chat | 任意 Chat / Messages / Responses 上游 |
 
-- 上游协议自动检测：`keys.json` 中的 `url` 静态判定（`api.openai.com`/`api.ofox.ai` = Responses 原生，`api.anthropic.com` = Messages 原生，其余 = Chat 通用），并对未知中继做动态探测（`/v1/models` 可用即 Chat，否则依次探测 `/v1/messages`、`/v1/responses` 端点）。动态结果写入独立协议缓存（24 小时 TTL），与模型列表缓存（成功 10 分钟 / 失败 30 秒）解耦：即使中继的 `/v1/models` 探测失败，已识别出的 Messages / Responses 协议也不会被错误降级回 Chat。后台每 10 分钟按 URL 去重重探各上游（同池多 Key 仅触发一次探测），新增/改配 Key 无需重启即可生效
+- 上游协议自动检测：`keys.json` 中的 `url` 静态判定（`api.openai.com`/`api.ofox.ai` = Responses 原生，`api.anthropic.com` = Messages 原生，`anytokens.cc` = 仅 Chat 通用并豁免动态探测，其余 = Chat 通用），并对未知中继做动态探测（`/v1/models` 可用即 Chat，否则依次探测 `/v1/messages`、`/v1/responses` 端点）。动态结果写入独立协议缓存（24 小时 TTL），与模型列表缓存（成功 10 分钟 / 失败 30 秒）解耦：即使中继的 `/v1/models` 探测失败，已识别出的 Messages / Responses 协议也不会被错误降级回 Chat。后台每 10 分钟按 URL 去重重探各上游（同池多 Key 仅触发一次探测），新增/改配 Key 无需重启即可生效
 - `/v1/chat/completions` 路由的多协议池判定同样使用动态协议：组内任一账号（静态白名单或动态探测）被识别为 Messages / Responses 上游，即自动启用 Chat→Messages / Chat→Responses 转换回退，无需在 `url` 上显式标记
 - 同协议上游优先透传（字节直通 / 终态保护），跨协议才做转换，避免无谓重写；协议池顺序：下游 Chat → `chat, messages, responses`；下游 Messages → `messages, chat, responses`；下游 Responses → `responses, chat, messages`
 - 任一 Key 失败自动切换到池内下一协议的下游 Key 重试，`#N` 强制指定 Key、boost/轮询、冷却与容量重排队照常生效
-- 上游返回「路径/协议不支持」类错误（如 anytokens 的 `does not allow /v1/messages dispatch`）时归类为 `unsupported_path`：错误如实回传调用方，但**不写入 Key 的 `failCode`**，不冷却、不锁定、不判失效——即使局域网其他设备或本机应用用错协议，也不会污染共享 Key，其他正常任务不受影响
+- 上游返回「路径/协议不支持」类错误（如 anytokens 的 `does not allow /v1/messages dispatch`，或 OpenAI-only 中继对 Ollama 风格探测路径返回的 `HTTP node only allows access to inference API paths`）时归类为 `unsupported_path`：错误如实回传调用方，但**不写入 Key 的 `failCode`**，不冷却、不锁定、不判失效——即使局域网其他设备或本机应用用错协议（含另一项目的进程用 `/api/show`、`/api/tags` 等非推理路径扫模型列表），也不会污染共享 Key，其他正常任务不受影响
 - 转换同时支持**流式与非流式**：跨协议时流式 body 强制 `stream:true`，响应经 SSE 转换器回写；非流式请求走一次性 JSON 响应转换器
 - 转换字段覆盖：文本、system/instructions、工具定义与调用链（`tool_use`↔`function_call`）、思考内容（`thinking`↔`reasoning`↔`reasoning_content`）、图片、usage 统计
 
@@ -1545,7 +1545,7 @@ A: 前端删除是软删除（设 `status="deleted"`），Key 仍在 keys.json�
 A: 管理弹窗找到 🔒 锁死的 Key，点击 🔓 解锁按钮，或手动调用 `POST /__reset-key {"idx": N}`。可在配置中关闭自动锁死（取消勾选「启用自动锁死」）或调整阈值 `lockAfterFailCount`。
 
 **Q: 局域网其他设备（或本机应用）用了上游不支持的协议/路径，会不会把 Key 搞失效？**
-A: 不会。当某 Key 的上游返回类似 `does not allow /v1/messages dispatch` 的「路径/协议不支持」错误（典型场景：把 Anthropic Messages 请求发到仅支持 OpenAI 协议的上游，或局域网/本机客户端配置了错误连接方式）时，代理会将其归类为 `unsupported_path`：请求仍会如实转发、并把上游错误（如 403）原样返回给调用方使其正确感知失败，但**不会**将该错误记为 Key 的 `failCode`，因此不会进入冷却、不会触发自动锁定、也不会被 `reset:"never"` 的 Key 判定为失效——共享该 Key 的其他正常任务（含本机 codex）完全不受影响。真正的 Key 失效（如 401 认证失败、余额不足等）仍会正常触发冷却与锁定。
+A: 不会。当某 Key 的上游返回类似 `does not allow /v1/messages dispatch` 或 `HTTP node only allows access to inference API paths` 的「路径/协议不支持」错误（典型场景：把 Anthropic Messages 请求发到仅支持 OpenAI 协议的上游；局域网/本机客户端配置了错误连接方式；或另一项目的进程用 Ollama 风格路径 `/api/show`、`/api/tags` 扫描模型列表，OpenAI-only 中继回 403）时，代理会将其归类为 `unsupported_path`：请求仍会如实转发、并把上游错误（如 403）原样返回给调用方使其正确感知失败，但**不会**将该错误记为 Key 的 `failCode`，因此不会进入冷却、不会触发自动锁定、也不会被 `reset:"never"` 的 Key 判定为失效——共享该 Key 的其他正常任务（含本机 codex）完全不受影响。真正的 Key 失效（如 401 认证失败、余额不足等）仍会正常触发冷却与锁定。
 
 **Q: 费用估算不准？**
 A: 先调整全局 `bytesPerToken` 和 `prices`；不同模型 token 密度不同，可用 `modelPricing` 为模型设置精确名称的单独单价和 `bytesPerToken`。这仍是字节估算，改价不会回算历史费用。
@@ -1577,6 +1577,10 @@ A: 未修改的官方 Release 资产会自动识别版本；源码安装（克�
 | [@anupamme](https://github.com/anupamme) | 提出管理 Token 不应保存于浏览器会话存储的安全改进思路（PR [#1](https://github.com/aipayim/codex-proxy/pull/1)）。当前版本在最新代码上完成了内存态适配，并补齐 WebSocket 认证路径。 |
 
 ## 更新日志
+
+- **2026-10-18 协议与流式一致性修复（Chat 中继静态白名单 / tool_choice 降级 / 纯工具调用终端）**：① 新增 `CHAT_NATIVE_HOSTS` 静态 Chat-only 中继白名单（如 `anytokens.cc`）：此类主机恒定按 `chat` 路由，`/v1/messages` 被上游账号组策略拒绝时不再被动态协议探测误判为 Messages/Responses；静态白名单优先于动态协议缓存。② `/v1/models` 成功探测已将协议钉为 `chat` 后，瞬时探测失败不再用端点猜测结果覆盖已确认协议（`failWithProtocol` 优先使用协议缓存），修复 confirmed chat 在抖动期被误标为 `messages`/`responses` 的回归。③ 四个请求方向转换器（responses/messages↔chat）在无 `tools` 或 `tools:[]` 时同步丢弃 `tool_choice`，避免 OpenAI-strict 上游 400 `"tool_choice is only allowed when tools are specified"`。④ 转换流新增 4xx 处理：新增 `tools_reasoning_incompatible` 分类，上游拒绝“tools + reasoning_effort”组合时同 Key 自动降级 `reasoning_effort=none` 重试一次（保留 tools/stream，工具循环不断）；其余 4xx 不再把 JSON 错误体灌入 SSE 转换器产生假 `upstream_eof_without_done` 终态，而是将真实上游错误直接返回调用方，且不写 `failCode`/不冷却 Key（请求形状问题而非 Key 问题）。⑤ 纯工具调用响应（无文本）不再发出空的 `response.output_text.done`，严格 OpenAI Responses 客户端（codex）不再因错位事件中断回合；文本响应仍携带真实文本发出 `output_text.done`。同步更新回归测试与许可证（ISC → MIT，新增 LICENSE）。
+
+- **2026-10-18 `unsupported_path` 匹配扩充：非推理路径 403 不再毒化 `reset:"never"` Key（3460/E组事件）**：另一项目的进程用 Ollama 风格路径（`/api/show`、`/api/tags`、`/api/v1/models`）扫描本地代理的模型列表，某 OpenAI-only 中继对非推理路径返回 403 `HTTP node only allows access to inference API paths (...)`。该文案未命中 `unsupported_path` 正则 → 被当作普通上游 API 错误走 `markFailure(403)`；E组 4 把 `reset:"never"` Key 因 `inCooldown()` 对 never Key 判定为 `!!failCode` 而进入**无时间上限的永久冷却**，整个 3460 端口不可用，只能在管理 key 页面手动重置。现为 `classifyUpstreamErrorMessage` 的 `unsupported_path` 正则追加 `only allows access to` 模式：此类 403 不写 `failCode`、不冷却 Key，错误原样回传探测方（重启代理后生效，已实战验证：30 发探测 403 后 4 把 Key 零中毒、继续 200）。同时运营侧启用 `autoRecover: true` + `autoRecoverInterval: 1`（小时，`autoRecoverCodes` 含 403）作为兜底——冷却 Key 每小时自动发轻量 `GET /v1/models` 探测恢复，无需再手动重置。Dashboard 跑马灯中模型显示 `?` 的 403 条目即这类无 body 的探测请求（`reqModel` 为空）。
 
 - **2026-08-29 修复 Messages→Chat 工具调用链断裂（Claude Code CLI）**：`/v1/messages`（Claude Code CLI）→ Chat 上游时，请求方向转换此前会**丢弃 assistant 消息中的 `tool_use` 块与 user 消息中的 `tool_result` 块**——第一轮的模型工具调用能正常送达（响应方向 `chat_to_messages_sse` 正确转为 `tool_use`），但第二轮起携带工具执行结果的请求会把工具上下文完全抹掉，导致上游看不到工具调用与结果、工具循环断裂。现请求方向转换器完整保留工具上下文：`tool_use` → assistant `tool_calls`（文本保留，纯工具调用 `content` 置 `null`）、`tool_result` → `role:"tool"` 消息，且**不再残留空白 `content:""` 的 user 消息**（旧实现会多输出一条空 user 消息并破坏 `assistant(tool_calls) → tool` 顺序，部分 OpenAI 兼容上游会因此异常），保证多轮工具往返合法。另修正 `tool_choice` 映射：Anthropic `{type:"any"}` → OpenAI `"required"`、`{type:"tool",name}` → `{type:"function",function:{name}}`（此前仅取 `.type` 生成非法值）。更新 README 协议转换说明并新增回归断言（tool_calls 结构、无空 user 消息、tool 紧跟 assistant、tool_choice 映射）。
 
